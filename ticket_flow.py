@@ -14,6 +14,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -31,18 +32,46 @@ OUT_DIR = Path(__file__).parent / "results"
 # Override with OPENROUTER_MODEL (e.g. a specific "<name>:free" id) in .env or the shell.
 DEFAULT_MODEL = "openrouter/free"
 
+# The labels the model may choose from. This set is only used to VALIDATE what the model
+# says; the route itself is never assigned in code, it is read out of the model's reply.
+VALID_ROUTES = ("billing", "orders")
+
 SYSTEM_PROMPT = (
     "You are a support assistant for Shopify merchants. "
-    "Read the merchant's message and reply helpfully and concisely."
+    "Read the merchant's message, decide which team it belongs to, and reply helpfully and concisely.\n"
+    "Teams: 'billing' (charges, app subscriptions, invoices, payouts, chargebacks, account holds) "
+    "or 'orders' (order fulfillment, shipping, addresses, refunds and cancellations on a customer order).\n"
+    'Answer with JSON only, no other text: {"route": "<billing or orders>", "reply": "<your reply to the merchant>"}'
 )
 
 
 class TicketState(TypedDict, total=False):
     ticket_id: str
     message_body: str  # input: the merchant's own text
-    response: str      # output: the model's reply
+    route: Optional[str]  # output: read from the model's reply (None if the reply had no valid route)
+    response: str      # output: the model's reply text to the merchant
+    raw: str           # output: the model's raw reply, kept so the route can be audited
     model: str         # output: which model actually answered
     error: Optional[str]
+
+
+def parse_reply(text: str) -> tuple[Optional[str], str]:
+    """Pull (route, reply) out of the model's raw reply. Never invents a route.
+
+    Returns route=None when the model gave no recognisable route, so a bad reply
+    shows up as a failure instead of being silently filed under some default.
+    """
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", (text or "").strip())
+    route, reply = None, cleaned
+    try:
+        start, end = cleaned.index("{"), cleaned.rindex("}") + 1
+        data = json.loads(cleaned[start:end])
+        route, reply = data.get("route"), data.get("reply", cleaned)
+    except (ValueError, AttributeError):
+        m = re.search(r'"route"\s*:\s*"([^"]+)"', cleaned)  # JSON was broken but the field is there
+        route = m.group(1) if m else None
+    route = route.strip().lower() if isinstance(route, str) else None
+    return (route if route in VALID_ROUTES else None), str(reply)
 
 
 def build_llm() -> ChatOpenAI:
@@ -70,15 +99,18 @@ def make_graph(llm):
             try:
                 reply = llm.invoke(messages)
                 meta = getattr(reply, "response_metadata", {}) or {}
+                route, text = parse_reply(reply.content)
                 return {
-                    "response": reply.content,
+                    "route": route,
+                    "response": text,
+                    "raw": reply.content,
                     "model": meta.get("model_name") or meta.get("model") or "",
-                    "error": None,
+                    "error": None if route else "model reply contained no valid route",
                 }
             except Exception as exc:  # free models are flaky: rate limits, 5xx, empty replies
                 last_err = f"{type(exc).__name__}: {exc}"
                 time.sleep(2 ** (attempt + 1))
-        return {"response": "", "model": "", "error": last_err}
+        return {"route": None, "response": "", "raw": "", "model": "", "error": last_err}
 
     g = StateGraph(TicketState)
     g.add_node("ask_model", ask_model)
@@ -103,15 +135,17 @@ def run(llm, tickets, out_path: Path) -> list[dict]:
             final = graph.invoke(t)
             row = {
                 "ticket_id": final["ticket_id"],
+                "route": final.get("route"),
                 "model": final.get("model", ""),
                 "response": final.get("response", ""),
+                "raw": final.get("raw", ""),
                 "error": final.get("error"),
             }
             out.write(json.dumps(row, ensure_ascii=False) + "\n")
             out.flush()
             results.append(row)
             status = "ERROR" if row["error"] else "ok"
-            print(f"{row['ticket_id']}: {status} ({row['model'] or '-'})")
+            print(f"{row['ticket_id']}: {status} route={row['route'] or '-'} ({row['model'] or '-'})")
     return results
 
 
