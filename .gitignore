@@ -1,0 +1,10 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python / OS
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
